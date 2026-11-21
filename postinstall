@@ -1,0 +1,55 @@
+#!/bin/bash
+# Wird vom macOS-Installer automatisch als root ausgeführt, nachdem NetMatch.app
+# nach /Applications kopiert wurde. Ersetzt das bisherige manuelle setup.sh.
+set -e
+
+SUDOERS=/etc/sudoers.d/netauto
+PLIST=/Library/LaunchDaemons/local.netauto.bpf.plist
+APP=/Applications/NetMatch.app
+
+# Angemeldeten Benutzer ermitteln (nicht den Installer-Admin, falls unterschiedlich)
+CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || true)
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+  CONSOLE_USER=$(/usr/bin/logname 2>/dev/null || true)
+fi
+
+if [ -n "$CONSOLE_USER" ]; then
+  TMP=$(mktemp)
+  echo "$CONSOLE_USER ALL=(root) NOPASSWD: /usr/sbin/networksetup" > "$TMP"
+  if /usr/sbin/visudo -cf "$TMP"; then
+    install -m 0440 -o root -g wheel "$TMP" "$SUDOERS"
+  fi
+  rm -f "$TMP"
+else
+  echo "NetMatch: Benutzer konnte nicht ermittelt werden – bitte die Einrichtung einmalig in der App öffnen." >&2
+fi
+
+cat > "$PLIST" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.netauto.bpf</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>chgrp admin /dev/bpf*; chmod 660 /dev/bpf*</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+EOF
+chown root:wheel "$PLIST"
+chmod 644 "$PLIST"
+launchctl bootout system "$PLIST" 2>/dev/null || true
+launchctl bootstrap system "$PLIST"
+chgrp admin /dev/bpf* 2>/dev/null || true
+chmod 660 /dev/bpf* 2>/dev/null || true
+
+# Sicherheitshalber eine eventuell gesetzte Quarantäne-Markierung entfernen
+if [ -d "$APP" ]; then
+  xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+fi
+
+exit 0

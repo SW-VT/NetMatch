@@ -1,0 +1,39 @@
+#!/bin/bash
+# Läuft vor der eigentlichen Installation – auch bei einer Aktualisierung.
+# Sorgt dafür, dass eine laufende Version sauber beendet wird (damit ihr eigener
+# Netzwerk-Reset noch greift) und dass keine Dateireste der alten Version bleiben.
+set -e
+
+APP_NAME="NetMatch"
+APP_PATH="/Applications/${APP_NAME}.app"
+
+CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || true)
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+  CONSOLE_USER=$(/usr/bin/logname 2>/dev/null || true)
+fi
+
+if [ -n "$CONSOLE_USER" ] && pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+  USER_ID=$(id -u "$CONSOLE_USER" 2>/dev/null || true)
+  if [ -n "$USER_ID" ]; then
+    # Bittet die laufende App regulär, sich zu beenden – ihr eigener
+    # Netzwerk-Reset (siehe Engine.swift) läuft dabei noch mit.
+    launchctl asuser "$USER_ID" sudo -u "$CONSOLE_USER" \
+      osascript -e "tell application \"$APP_NAME\" to quit" >/dev/null 2>&1 || true
+  fi
+
+  for _ in $(seq 1 10); do
+    pgrep -x "$APP_NAME" >/dev/null 2>&1 || break
+    sleep 1
+  done
+
+  # Reagiert sie nicht, notfalls hart beenden, damit die Installation weitergeht
+  if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+    pkill -x "$APP_NAME" || true
+    sleep 1
+  fi
+fi
+
+# Alte Version vollständig entfernen, damit keine Dateireste liegen bleiben
+rm -rf "$APP_PATH"
+
+exit 0

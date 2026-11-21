@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import Combine
+import UniformTypeIdentifiers
 
 // MARK: - Modelle
 
@@ -25,7 +26,7 @@ struct Detection { var ip: String; var mask: String }
 // MARK: - Shell-Helfer
 
 @discardableResult
-func shell(_ path: String, _ args: [String]) -> (status: Int32, out: String) {
+func shell(_ path: String, _ args: [String], timeout: Double = 8) -> (status: Int32, out: String) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
@@ -33,8 +34,12 @@ func shell(_ path: String, _ args: [String]) -> (status: Int32, out: String) {
     p.standardOutput = pipe
     p.standardError = pipe
     do { try p.run() } catch { return (-1, "\(error)") }
+    // Absicherung: ein hängender Prozess (z. B. durch ein defektes System) blockiert die App nie unbegrenzt.
+    let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
+    watchdog.cancel()
     return (p.terminationStatus, String(decoding: data, as: UTF8.self))
 }
 
@@ -133,7 +138,11 @@ final class Buf {
 final class Engine: ObservableObject {
     @Published var ports: [Port] = []
     @Published var selected: String = UserDefaults.standard.string(forKey: "selected") ?? "" {
-        didSet { UserDefaults.standard.set(selected, forKey: "selected"); wasUp = linkUp }
+        didSet {
+            UserDefaults.standard.set(selected, forKey: "selected")
+            needsSync = true
+            if let p = currentPort { linkUp = portUp[p.device] ?? false; currentIP = portIP[p.device] ?? "–" }
+        }
     }
     @Published var autoOn = false
     @Published var linkUp = false
@@ -153,17 +162,28 @@ final class Engine: ObservableObject {
     private var task: Task<Void, Never>?
     private var capture: Process?
     private var wasUp = false
+    private var needsSync = false
+    private var isPolling = false
+    private var tick = 0
+    @Published var portUp: [String: Bool] = [:]      // Link-Status aller Adapter (BSD-Name)
+    @Published var portIP: [String: String] = [:]    // aktuelle IPv4 je Adapter
     private let dhcpSeconds = 10
+    private var touchedServices: Set<String> = []    // Dienste, die diese Sitzung verändert hat
 
     init() {
         if let d = UserDefaults.standard.data(forKey: "profiles"),
            let p = try? JSONDecoder().decode([StaticProfile].self, from: d) { profiles = p }
         if listenSeconds < 3 { listenSeconds = 8 }
         refreshPorts()
-        // Beim Beenden der App läuft garantiert nichts weiter
+        // Beim echten Beenden der App: nichts läuft mehr weiter, UND alle von dieser
+        // Sitzung geänderten Adapter gehen zurück auf DHCP. Läuft synchron, damit es
+        // vor dem tatsächlichen Prozessende fertig ist.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.cancel() }
+            MainActor.assumeIsolated {
+                self?.cancel()
+                self?.resetAllTouchedBeforeQuit()
+            }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.poll() }
@@ -194,16 +214,37 @@ final class Engine: ObservableObject {
                 service = String(line[line.index(after: close)...]).trimmingCharacters(in: .whitespaces)
             }
         }
-        ports = result
-        if currentPort == nil { selected = result.first?.service ?? "" }
+        if result != ports { ports = result }
+        if selected.isEmpty { selected = result.first?.service ?? "" }   // nie still den Adapter wechseln
+    }
+
+    func refreshStates() async {
+        let list = ports
+        let r: [String: (Bool, String?)] = await bg {
+            var d: [String: (Bool, String?)] = [:]
+            for p in list {
+                let up = isLinkUp(p.device)
+                d[p.device] = (up, up ? ipOf(p.device) : nil)
+            }
+            return d
+        }
+        portUp = r.mapValues { $0.0 }
+        portIP = r.compactMapValues { $0.1 }
     }
 
     // Reine Anzeige (nur lesen). Handeln tut die App nur, wenn die Automatik an ist.
     func poll() async {
+        if isPolling { return }
+        isPolling = true
+        defer { isPolling = false }
+        tick += 1
+        if tick % 8 == 0 { refreshPorts() }      // USB-Adapter kommen und gehen
+        if tick % 4 == 1 { await refreshStates() }  // alle ~2 s Status aller Adapter
         guard let port = currentPort else { return }
         let (up, ip) = await bg { (isLinkUp(port.device), ipOf(port.device)) }
         linkUp = up
         currentIP = ip ?? "–"
+        if needsSync { wasUp = up; needsSync = false }   // nach Adapterwechsel nichts auslösen
         if autoOn && up && !wasUp { runSequence() }
         if !up && wasUp {
             cancel()
@@ -236,10 +277,32 @@ final class Engine: ObservableObject {
         cancel()
         let ok = netsetup(["-setdhcp", port.service])
         log(ok ? "Auf DHCP zurückgesetzt" : "Fehler bei networksetup: \(lastNetsetupOutput)")
+        if ok { touchedServices.remove(port.service) }
         status = "DHCP"
     }
 
+    /// Setzt beim Beenden der App alle Adapter zurück, die in dieser Sitzung verändert wurden.
+    /// Läuft bewusst synchron (kein Task/await), damit es sicher vor dem Prozessende fertig wird.
+    /// Hinweis: Das setzt die Adapter auf DHCP – den ursprünglichen Zustand vor dem ersten
+    /// Anstecken kennt die App nicht, DHCP ist aber die unkritische Voreinstellung.
+    /// Ein harter Abbruch (Absturz, "Sofort beenden") löst das nicht aus.
+    func resetAllTouchedBeforeQuit() {
+        guard !touchedServices.isEmpty else { return }
+        for svc in touchedServices {
+            _ = netsetup(["-setdhcp", svc])
+        }
+        touchedServices.removeAll()
+    }
+
     // MARK: Ablauf
+
+    /// Bricht laufende Automatik sauber ab, wenn das Kabel währenddessen gezogen wurde.
+    func cableWasPulled(_ dev: String) async -> Bool {
+        guard await bg({ !isLinkUp(dev) }) else { return false }
+        log("Kabel wurde getrennt – Vorgang abgebrochen")
+        status = "Abgebrochen (Kabel getrennt)"
+        return true
+    }
 
     func sequence(_ port: Port) async {
         let svc = port.service, dev = port.device
@@ -252,8 +315,10 @@ final class Engine: ObservableObject {
             status = "Fehler beim Umstellen – siehe Protokoll"
             return
         }
+        touchedServices.insert(svc)
         let (det, err) = await listen(dev, seconds: listenSeconds)
         if Task.isCancelled { return }
+        if await cableWasPulled(dev) { return }
         if !err.isEmpty { log(err) }
         if let d = det {
             let own = ownAddress(for: d)
@@ -274,6 +339,7 @@ final class Engine: ObservableObject {
         for _ in 0..<dhcpSeconds {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             if Task.isCancelled { return }
+            if await cableWasPulled(dev) { return }
             if let ip = await bg({ ipOf(dev) }), !ip.hasPrefix("169.254.") {
                 log("DHCP-Adresse erhalten: \(ip)")
                 status = "DHCP: \(ip)"
@@ -284,6 +350,7 @@ final class Engine: ObservableObject {
 
         // 3) Eigene Profile der Reihe nach
         for p in profiles {
+            if await cableWasPulled(dev) { return }
             status = "Probiere Profil „\(p.name)“ …"
             _ = await applyStatic(svc, ip: p.ip, mask: p.mask, router: p.router)
             if Task.isCancelled { return }
@@ -305,6 +372,7 @@ final class Engine: ObservableObject {
     }
 
     func applyStatic(_ svc: String, ip: String, mask: String, router: String) async -> Bool {
+        touchedServices.insert(svc)
         let ok: Bool = await bg {
             if !router.isEmpty { return netsetup(["-setmanual", svc, ip, mask, router]) }
             // Je nach macOS-Version wird ein Router verlangt → Fallback mit 0.0.0.0
@@ -343,5 +411,35 @@ final class Engine: ObservableObject {
             return (nil, "Keine Berechtigung zum Mitlesen – setup.sh ausführen und neu starten")
         }
         return (analyze(t), "")
+    }
+
+    // MARK: Profile teilen
+
+    func exportProfiles() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "NetMatch-Profile.json"
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let data = try? JSONEncoder().encode(profiles) else { log("Export fehlgeschlagen"); return }
+        do {
+            try data.write(to: url)
+            log("\(profiles.count) Profil(e) exportiert nach \(url.lastPathComponent)")
+        } catch {
+            log("Export fehlgeschlagen: \(error.localizedDescription)")
+        }
+    }
+
+    func importProfiles() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let data = try? Data(contentsOf: url),
+              let imported = try? JSONDecoder().decode([StaticProfile].self, from: data) else {
+            log("Import fehlgeschlagen – Datei ist kein gültiges Profil-Export")
+            return
+        }
+        profiles.append(contentsOf: imported)
+        log("\(imported.count) Profil(e) importiert")
     }
 }
